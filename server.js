@@ -119,14 +119,33 @@ app.post('/v1/chat/completions', async (req, res) => {
         })
     };
     
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json'
-    });
+// Make request to NVIDIA NIM API with automated retry logic
+    let response;
+    let retries = 3; // Retry up to 3 times
+    let delay = 1000; // Wait 1 second between attempts
+
+    while (retries > 0) {
+      try {
+        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+          headers: {
+            'Authorization': `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: stream ? 'stream' : 'json'
+        });
+        break; // Success! Break out of the loop.
+      } catch (error) {
+        // If it's a 503 or 429, try again
+        if ((error.response?.status === 503 || error.response?.status === 429) && retries > 1) {
+          console.warn(`NVIDIA API busy (Status ${error.response.status}). Retrying in ${delay}ms...`);
+          retries--;
+          await new Promise(res => setTimeout(res, delay));
+          delay *= 1.5; // Exponential backoff
+        } else {
+          throw error; // Critical failure or ran out of retries, bubble it up
+        }
+      }
+    }
     
     if (stream) {
       // Handle streaming response with reasoning
