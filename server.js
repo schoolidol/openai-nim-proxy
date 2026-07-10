@@ -90,6 +90,20 @@ app.post('/v1/chat/completions', async (req, res) => {
         }
       }
     }
+
+    // 🚀 INJECT SYSTEM PROMPT HACK: Forces reasoning to always be on and strictly in English
+    let processedMessages = [...messages];
+
+    if (ENABLE_THINKING_MODE) {
+      const systemMsgIndex = processedMessages.findIndex(m => m.role === 'system');
+      const forceReasoningPrompt = "CRITICAL OPERATIONAL MANDATE: You must use your internal chain-of-thought (<think>) block to meticulously break down every single request step-by-step before answering, regardless of how simple or brief the query is. You must conduct all internal reasoning steps and final responses strictly in English. Never skip the reasoning phase.";
+
+      if (systemMsgIndex !== -1) {
+        processedMessages[systemMsgIndex].content += `\n\n${forceReasoningPrompt}`;
+      } else {
+        processedMessages.unshift({ role: 'system', content: forceReasoningPrompt });
+      }
+    }
     
     // Transform OpenAI request to NIM format
     const nimRequest = {
