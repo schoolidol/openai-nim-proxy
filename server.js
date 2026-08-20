@@ -116,8 +116,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         enable_thinking: true,
         reasoning_effort: "high",
         chat_template_kwargs: {
-          thinking: true,
-          enable_thinking: true
+          enable_thinking: true,
+          clear_thinking: false,
+          thinking: true
           }
         })
     };
