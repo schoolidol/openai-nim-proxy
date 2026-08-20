@@ -6,33 +6,27 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware
 app.use(cors());
 app.use(express.json({ limit: '100mb' })); 
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
-// NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output
 const SHOW_REASONING = true;
-
-// 🔥 THINKING MODE TOGGLE - Enables reasoning parameters
 const ENABLE_THINKING_MODE = true;
 
-// Model mapping
+// Verified active NVIDIA NIM endpoint names
 const MODEL_MAPPING = {
-  'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
-  'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
-  'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
+  'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
+  'gpt-4': 'meta/llama-3.1-70b-instruct',
+  'gpt-4-turbo': 'meta/llama-3.1-405b-instruct',
   'gpt-4o': 'deepseek-ai/deepseek-r1',
-  'claude-3-opus': 'openai/gpt-oss-120b',
-  'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'claude-3-opus': 'deepseek-ai/deepseek-r1',
+  'claude-3-sonnet': 'meta/llama-3.1-70b-instruct',
+  'gemini-pro': 'qwen/qwen2.5-coder-32b-instruct'
 };
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -42,7 +36,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// List models endpoint
 app.get('/v1/models', (req, res) => {
   const models = Object.keys(MODEL_MAPPING).map(model => ({
     id: model,
@@ -51,53 +44,22 @@ app.get('/v1/models', (req, res) => {
     owned_by: 'nvidia-nim-proxy'
   }));
   
-  res.json({
-    object: 'list',
-    data: models
-  });
+  res.json({ object: 'list', data: models });
 });
 
-// Chat completions endpoint
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Smart model selection with fallback
-    let nimModel = MODEL_MAPPING[model];
-    if (!nimModel) {
-      try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
-          model: model,
-          messages: [{ role: 'user', content: 'test' }],
-          max_tokens: 1
-        }, {
-          headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) {
-            nimModel = model;
-          }
-        });
-      } catch (e) {}
-      
-      if (!nimModel) {
-        const modelLower = model.toLowerCase();
-        if (modelLower.includes('gpt-4') || modelLower.includes('claude-opus') || modelLower.includes('405b')) {
-          nimModel = 'meta/llama-3.1-405b-instruct';
-        } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
-          nimModel = 'meta/llama-3.1-70b-instruct';
-        } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
-        }
-      }
-    }
+    // Pick mapped model or fall back to verified default
+    let nimModel = MODEL_MAPPING[model] || model;
 
-    // 1. Inject System Prompt Hack to force Chain-of-Thought in English
+    // Process system prompt for reasoning
     let processedMessages = Array.isArray(messages) ? [...messages] : [];
 
     if (ENABLE_THINKING_MODE) {
       const systemMsgIndex = processedMessages.findIndex(m => m.role === 'system');
-      const forceReasoningPrompt = "CRITICAL OPERATIONAL MANDATE: You must use your internal chain-of-thought (<think>) block to meticulously break down every single request step-by-step before answering, regardless of how simple or brief the query is. You must conduct all internal reasoning steps and final responses strictly in English. Never skip the reasoning phase.";
+      const forceReasoningPrompt = "CRITICAL OPERATIONAL MANDATE: Meticulously break down every request step-by-step using internal reasoning (<think> block) before providing the final answer. Keep explanations and reasoning strictly in English.";
 
       if (systemMsgIndex !== -1) {
         processedMessages[systemMsgIndex] = {
@@ -109,61 +71,40 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     
-    // 2. Build NVIDIA Request Payload according to model requirements
+    // Clean NVIDIA payload - NO extra_body parameter
     const nimRequest = {
       model: nimModel,
-      messages: processedMessages, // FIXED: Now properly uses processedMessages
-      temperature: temperature || 0.6,
-      max_tokens: max_tokens || 9024,
-      stream: stream || false
+      messages: processedMessages,
+      temperature: temperature ?? 0.6,
+      max_tokens: max_tokens ?? 4096,
+      stream: stream ?? false
     };
 
+    // Inject native chat_template_kwargs at top level
     if (ENABLE_THINKING_MODE) {
-      const lowerModel = nimModel.toLowerCase();
-      
-      // GLM and Qwen models require chat_template_kwargs
-      if (lowerModel.includes('glm') || lowerModel.includes('qwen')) {
-        nimRequest.chat_template_kwargs = {
-          enable_thinking: true,
-          thinking: true
-        };
-      } else {
-        // DeepSeek, Kimi, and other NIM models require extra_body or top-level thinking
-        nimRequest.extra_body = {
-          thinking: { type: "enabled" }
-        };
-        nimRequest.chat_template_kwargs = { thinking: true };
-      }
+      nimRequest.chat_template_kwargs = {
+        enable_thinking: true,
+        clear_thinking: false
+      };
+      nimRequest.reasoning_effort = "high";
     }
     
-    // 3. Request with Retry Logic
+    // Send request to NVIDIA NIM API
     let response;
-    let retries = 3;
-    let delay = 1000;
-
-    while (retries > 0) {
-      try {
-        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-          headers: {
-            'Authorization': `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: stream ? 'stream' : 'json'
-        });
-        break;
-      } catch (error) {
-        if ((error.response?.status === 503 || error.response?.status === 429) && retries > 1) {
-          console.warn(`NVIDIA API busy (Status ${error.response.status}). Retrying in ${delay}ms...`);
-          retries--;
-          await new Promise(res => setTimeout(res, delay));
-          delay *= 1.5;
-        } else {
-          throw error;
-        }
-      }
+    try {
+      response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+        headers: {
+          'Authorization': `Bearer ${NIM_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        responseType: stream ? 'stream' : 'json'
+      });
+    } catch (err) {
+      console.error('NVIDIA Request Error Payload:', JSON.stringify(nimRequest, null, 2));
+      throw err;
     }
     
-    // 4. Handle Streaming
+    // Handle Streaming
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
@@ -187,7 +128,6 @@ app.post('/v1/chat/completions', async (req, res) => {
             try {
               const data = JSON.parse(line.slice(6));
               if (data.choices?.[0]?.delta) {
-                // Catch all possible keys NVIDIA uses for reasoning
                 const reasoning = data.choices[0].delta.reasoning_content || 
                                   data.choices[0].delta.reasoning || 
                                   data.choices[0].delta.thinking || '';
@@ -210,11 +150,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     combinedContent += content;
                   }
                   
-                  if (combinedContent) {
-                    data.choices[0].delta.content = combinedContent;
-                  } else {
-                    data.choices[0].delta.content = '';
-                  }
+                  data.choices[0].delta.content = combinedContent;
                 } else {
                   data.choices[0].delta.content = content;
                 }
@@ -237,7 +173,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.end();
       });
     } else {
-      // 5. Handle Non-Streaming
+      // Handle Non-Streaming
       const choice = response.data.choices?.[0];
       let fullContent = choice?.message?.content || '';
       const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || choice?.message?.thinking;
@@ -246,7 +182,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         fullContent = '<think>\n' + reasoning + '\n</think>\n\n' + fullContent;
       }
 
-      const openaiResponse = {
+      res.json({
         id: `chatcmpl-${Date.now()}`,
         object: 'chat.completion',
         created: Math.floor(Date.now() / 1000),
@@ -260,38 +196,24 @@ app.post('/v1/chat/completions', async (req, res) => {
           finish_reason: choice?.finish_reason || 'stop'
         }],
         usage: response.data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-      };
-      
-      res.json(openaiResponse);
+      });
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    const status = error.response?.status || 500;
+    const errorDetails = error.response?.data || error.message;
+    console.error(`Proxy error [${status}]:`, errorDetails);
     
-    res.status(error.response?.status || 500).json({
+    res.status(status).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: typeof errorDetails === 'object' ? JSON.stringify(errorDetails) : errorDetails,
         type: 'invalid_request_error',
-        code: error.response?.status || 500
+        code: status
       }
     });
   }
 });
 
-// Catch-all
-app.all('*', (req, res) => {
-  res.status(404).json({
-    error: {
-      message: `Endpoint ${req.path} not found`,
-      type: 'invalid_request_error',
-      code: 404
-    }
-  });
-});
-
 app.listen(PORT, () => {
-  console.log(`OpenAI to NVIDIA NIM Proxy running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`Reasoning display: ${SHOW_REASONING ? 'ENABLED' : 'DISABLED'}`);
-  console.log(`Thinking mode: ${ENABLE_THINKING_MODE ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Proxy active on port ${PORT}`);
 });
