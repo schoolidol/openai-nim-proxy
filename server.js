@@ -82,7 +82,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (ENABLE_THINKING_MODE) {
       // Per NVIDIA docs: Use "detailed thinking on" to trigger native reasoning mode
       const systemMsgIndex = processedMessages.findIndex(m => m.role === 'system');
-      const forceReasoningPrompt = "detailed thinking on\n\nYou must conduct all internal reasoning steps strictly in English.";
+      const forceReasoningPrompt = "detailed thinking on. You must conduct all internal reasoning steps strictly in English.";
 
       if (systemMsgIndex !== -1) {
         processedMessages[systemMsgIndex].content = `${forceReasoningPrompt}\n\n${processedMessages[systemMsgIndex].content}`;
