@@ -16,7 +16,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const SHOW_REASONING = true;
 const ENABLE_THINKING_MODE = true;
 
-// Active NVIDIA NIM model endpoints
+// Model mappings to active NVIDIA NIM models
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
   'gpt-4': 'meta/llama-3.1-70b-instruct',
@@ -27,8 +27,34 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen2.5-coder-32b-instruct'
 };
 
+// ----------------------------------------------------
+// LOCAL CONCURRENCY QUEUE & PACING (40 RPM MAX LIMIT)
+// ----------------------------------------------------
+let lastRequestTime = 0;
+const MIN_REQUEST_INTERVAL_MS = 1500; // Force 1.5s gap between outgoing calls
+
+let requestQueue = Promise.resolve();
+
+function enqueueRequest(fn) {
+  requestQueue = requestQueue.then(async () => {
+    const now = Date.now();
+    const timeSinceLast = now - lastRequestTime;
+    if (timeSinceLast < MIN_REQUEST_INTERVAL_MS) {
+      await new Promise(res => setTimeout(res, MIN_REQUEST_INTERVAL_MS - timeSinceLast));
+    }
+    lastRequestTime = Date.now();
+    return fn();
+  });
+  return requestQueue;
+}
+
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' });
+  res.json({ 
+    status: 'ok', 
+    service: 'OpenAI to NVIDIA NIM Proxy', 
+    reasoning_display: SHOW_REASONING,
+    thinking_mode: ENABLE_THINKING_MODE
+  });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -48,9 +74,10 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     let processedMessages = Array.isArray(messages) ? [...messages] : [];
 
+    // Inject reasoning system prompt
     if (ENABLE_THINKING_MODE) {
       const systemMsgIndex = processedMessages.findIndex(m => m.role === 'system');
-      const forceReasoningPrompt = "CRITICAL OPERATIONAL MANDATE: Meticulously break down every request step-by-step using internal reasoning (<think> block) before providing the final answer. Keep explanations and reasoning strictly in English.";
+      const forceReasoningPrompt = "detailed thinking on\nCRITICAL MANDATE: Conduct step-by-step reasoning (<think> block) before providing the final answer. Keep explanations strictly in English.";
 
       if (systemMsgIndex !== -1) {
         processedMessages[systemMsgIndex] = {
@@ -78,36 +105,36 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.reasoning_effort = "high";
     }
 
-    // Fast retry mechanism for stuck connections
-    let response;
-    let retries = 2; // Keep low to avoid massive compounding delay
-    let backoffDelay = 1000;
+    // Execute through local queue with retries
+    const response = await enqueueRequest(async () => {
+      let retries = 3;
+      let delay = 1500;
 
-    while (retries >= 0) {
-      try {
-        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-          headers: {
-            'Authorization': `Bearer ${NIM_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          responseType: stream ? 'stream' : 'json',
-          timeout: 4000 // 🔥 CUT OFF HANGING SOCKETS AFTER 4 SECONDS
-        });
-        break; // Success
-      } catch (err) {
-        const statusCode = err.response?.status;
-        const isTimeout = err.code === 'ECONNABORTED';
+      while (retries >= 0) {
+        try {
+          return await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+            headers: {
+              'Authorization': `Bearer ${NIM_API_KEY}`,
+              'Content-Type': 'application/json'
+            },
+            responseType: stream ? 'stream' : 'json',
+            timeout: 8000 // 🔥 CUT OFF HANGING CONNECTIONS AT 8 SECONDS
+          });
+        } catch (err) {
+          const status = err.response?.status;
+          const isTimeout = err.code === 'ECONNABORTED';
 
-        if ((statusCode === 429 || statusCode === 503 || isTimeout) && retries > 0) {
-          console.warn(`[NVIDIA Queue Busy/Timeout] Retrying immediately in ${backoffDelay}ms... (${retries} left)`);
-          await new Promise(res => setTimeout(res, backoffDelay));
-          backoffDelay *= 1.5;
-          retries--;
-        } else {
-          throw err;
+          if ((status === 429 || status === 503 || isTimeout) && retries > 0) {
+            console.warn(`[NVIDIA Rate Limit / Timeout] Retrying in ${delay}ms... (${retries} left)`);
+            await new Promise(r => setTimeout(r, delay));
+            delay *= 2;
+            retries--;
+          } else {
+            throw err;
+          }
         }
       }
-    }
+    });
 
     // Handle Streaming
     if (stream) {
@@ -210,7 +237,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     res.status(status).json({
       error: {
-        message: status === 429 ? 'NVIDIA NIM queue overloaded. Please try again shortly.' : error.message,
+        message: status === 429 ? 'NVIDIA API rate limit reached (40 RPM cap). Request queued or retried.' : error.message,
         type: 'rate_limit_error',
         code: status
       }
@@ -218,4 +245,6 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Proxy running on http://localhost:${PORT}`);
+});
