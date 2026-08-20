@@ -16,7 +16,7 @@ const NIM_API_KEY = process.env.NIM_API_KEY;
 const SHOW_REASONING = true;
 const ENABLE_THINKING_MODE = true;
 
-// Verified active NVIDIA NIM endpoint names
+// Active NVIDIA NIM model endpoints
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'meta/llama-3.1-8b-instruct',
   'gpt-4': 'meta/llama-3.1-70b-instruct',
@@ -27,29 +27,8 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen2.5-coder-32b-instruct'
 };
 
-// ----------------------------------------------------
-// SIMPLE RATE LIMITER & QUEUE MANAGER TO PREVENT 429
-// ----------------------------------------------------
-const MIN_REQUEST_INTERVAL_MS = 2000; // Force 2 seconds delay between API calls (~30 RPM)
-let lastRequestTime = 0;
-
-async function waitForRateLimitSlot() {
-  const now = Date.now();
-  const timeSinceLast = now - lastRequestTime;
-  if (timeSinceLast < MIN_REQUEST_INTERVAL_MS) {
-    const waitTime = MIN_REQUEST_INTERVAL_MS - timeSinceLast;
-    await new Promise(res => setTimeout(res, waitTime));
-  }
-  lastRequestTime = Date.now();
-}
-
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
-    reasoning_display: SHOW_REASONING,
-    thinking_mode: ENABLE_THINKING_MODE
-  });
+  res.json({ status: 'ok', service: 'OpenAI to NVIDIA NIM Proxy' });
 });
 
 app.get('/v1/models', (req, res) => {
@@ -59,14 +38,12 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
   res.json({ object: 'list', data: models });
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
-    
     let nimModel = MODEL_MAPPING[model] || model;
 
     let processedMessages = Array.isArray(messages) ? [...messages] : [];
@@ -101,39 +78,37 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.reasoning_effort = "high";
     }
 
-    // ----------------------------------------------------
-    // RETRY LOGIC FOR 429 RATE LIMIT ERRORS
-    // ----------------------------------------------------
+    // Fast retry mechanism for stuck connections
     let response;
-    let retries = 5;
-    let backoffDelay = 2000; // Start with 2 second delay
+    let retries = 2; // Keep low to avoid massive compounding delay
+    let backoffDelay = 1000;
 
-    while (retries > 0) {
+    while (retries >= 0) {
       try {
-        // Space out calls to respect global 30 RPM window
-        await waitForRateLimitSlot();
-
         response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
           headers: {
             'Authorization': `Bearer ${NIM_API_KEY}`,
             'Content-Type': 'application/json'
           },
-          responseType: stream ? 'stream' : 'json'
+          responseType: stream ? 'stream' : 'json',
+          timeout: 4000 // 🔥 CUT OFF HANGING SOCKETS AFTER 4 SECONDS
         });
-        break; // Success! Exit retry loop
+        break; // Success
       } catch (err) {
         const statusCode = err.response?.status;
-        if ((statusCode === 429 || statusCode === 503) && retries > 1) {
-          console.warn(`[429 Rate Limit] NVIDIA busy. Retrying in ${backoffDelay / 1000}s... (${retries - 1} retries left)`);
+        const isTimeout = err.code === 'ECONNABORTED';
+
+        if ((statusCode === 429 || statusCode === 503 || isTimeout) && retries > 0) {
+          console.warn(`[NVIDIA Queue Busy/Timeout] Retrying immediately in ${backoffDelay}ms... (${retries} left)`);
           await new Promise(res => setTimeout(res, backoffDelay));
-          backoffDelay *= 2; // Exponential backoff (2s -> 4s -> 8s -> 16s)
+          backoffDelay *= 1.5;
           retries--;
         } else {
-          throw err; // Fail on non-429 or exhausted retries
+          throw err;
         }
       }
     }
-    
+
     // Handle Streaming
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream');
@@ -230,13 +205,12 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    const status = error.response?.status || 500;
-    const errorDetails = error.response?.data || error.message;
-    console.error(`Proxy error [${status}]:`, errorDetails);
+    const status = error.response?.status || (error.code === 'ECONNABORTED' ? 429 : 500);
+    console.error(`Proxy Error [${status}]:`, error.message);
     
     res.status(status).json({
       error: {
-        message: typeof errorDetails === 'object' ? JSON.stringify(errorDetails) : errorDetails,
+        message: status === 429 ? 'NVIDIA NIM queue overloaded. Please try again shortly.' : error.message,
         type: 'rate_limit_error',
         code: status
       }
@@ -244,6 +218,4 @@ app.post('/v1/chat/completions', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Proxy active on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
