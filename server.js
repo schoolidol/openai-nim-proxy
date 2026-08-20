@@ -27,6 +27,22 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen2.5-coder-32b-instruct'
 };
 
+// ----------------------------------------------------
+// SIMPLE RATE LIMITER & QUEUE MANAGER TO PREVENT 429
+// ----------------------------------------------------
+const MIN_REQUEST_INTERVAL_MS = 2000; // Force 2 seconds delay between API calls (~30 RPM)
+let lastRequestTime = 0;
+
+async function waitForRateLimitSlot() {
+  const now = Date.now();
+  const timeSinceLast = now - lastRequestTime;
+  if (timeSinceLast < MIN_REQUEST_INTERVAL_MS) {
+    const waitTime = MIN_REQUEST_INTERVAL_MS - timeSinceLast;
+    await new Promise(res => setTimeout(res, waitTime));
+  }
+  lastRequestTime = Date.now();
+}
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -51,10 +67,8 @@ app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
-    // Pick mapped model or fall back to verified default
     let nimModel = MODEL_MAPPING[model] || model;
 
-    // Process system prompt for reasoning
     let processedMessages = Array.isArray(messages) ? [...messages] : [];
 
     if (ENABLE_THINKING_MODE) {
@@ -71,7 +85,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       }
     }
     
-    // Clean NVIDIA payload - NO extra_body parameter
     const nimRequest = {
       model: nimModel,
       messages: processedMessages,
@@ -80,7 +93,6 @@ app.post('/v1/chat/completions', async (req, res) => {
       stream: stream ?? false
     };
 
-    // Inject native chat_template_kwargs at top level
     if (ENABLE_THINKING_MODE) {
       nimRequest.chat_template_kwargs = {
         enable_thinking: true,
@@ -88,20 +100,38 @@ app.post('/v1/chat/completions', async (req, res) => {
       };
       nimRequest.reasoning_effort = "high";
     }
-    
-    // Send request to NVIDIA NIM API
+
+    // ----------------------------------------------------
+    // RETRY LOGIC FOR 429 RATE LIMIT ERRORS
+    // ----------------------------------------------------
     let response;
-    try {
-      response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-        headers: {
-          'Authorization': `Bearer ${NIM_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        responseType: stream ? 'stream' : 'json'
-      });
-    } catch (err) {
-      console.error('NVIDIA Request Error Payload:', JSON.stringify(nimRequest, null, 2));
-      throw err;
+    let retries = 5;
+    let backoffDelay = 2000; // Start with 2 second delay
+
+    while (retries > 0) {
+      try {
+        // Space out calls to respect global 30 RPM window
+        await waitForRateLimitSlot();
+
+        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+          headers: {
+            'Authorization': `Bearer ${NIM_API_KEY}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: stream ? 'stream' : 'json'
+        });
+        break; // Success! Exit retry loop
+      } catch (err) {
+        const statusCode = err.response?.status;
+        if ((statusCode === 429 || statusCode === 503) && retries > 1) {
+          console.warn(`[429 Rate Limit] NVIDIA busy. Retrying in ${backoffDelay / 1000}s... (${retries - 1} retries left)`);
+          await new Promise(res => setTimeout(res, backoffDelay));
+          backoffDelay *= 2; // Exponential backoff (2s -> 4s -> 8s -> 16s)
+          retries--;
+        } else {
+          throw err; // Fail on non-429 or exhausted retries
+        }
+      }
     }
     
     // Handle Streaming
@@ -207,7 +237,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     res.status(status).json({
       error: {
         message: typeof errorDetails === 'object' ? JSON.stringify(errorDetails) : errorDetails,
-        type: 'invalid_request_error',
+        type: 'rate_limit_error',
         code: status
       }
     });
