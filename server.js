@@ -31,6 +31,14 @@ const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
 // instance, but succeed immediately on a fresh retry.
 const RETRYABLE_STATUSES = [503, 429, 410];
 
+// 🔥 FIX: How long to wait for NVIDIA before giving up on a single attempt.
+// Previously there was no timeout at all (axios default = 0 = wait forever),
+// so a stalled request would just hang until JanitorAI/SillyTavern or Render
+// eventually killed it on their own end (~5 min later) instead of your own
+// retry logic ever getting a chance to run. Tune this based on how long a
+// normal generation takes for your longest responses.
+const REQUEST_TIMEOUT_MS = 30000;
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -38,7 +46,8 @@ const MODEL_MAPPING = {
   'gpt-4o': 'deepseek-ai/deepseek-v4-flash-0731',
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
+  'deepseek-ai/deepseek-v4-flash-0731': 'deepseek-ai/deepseek-v4-flash-0731'
 };
 
 // 🔥 FIX: Per-model reasoning/thinking config.
@@ -60,7 +69,10 @@ function getReasoningPayload(nimModel) {
   }
 
   // Default: Nemotron/vLLM-style reasoning kwargs used by the other
-  // mapped models. Extend this with more per-model branches as needed.
+  // mapped models. NOTE: models added later via the includes('/') fallback
+  // below will also hit this default branch - if a new model starts
+  // throwing 400/410s that retries don't fix, this mismatch is the first
+  // place to check and give its own branch, same as DeepSeek got.
   return {
     reasoning_effort: 'high',
     chat_template_kwargs: {
@@ -98,15 +110,17 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     let nimModel = MODEL_MAPPING[model];
 
-    // 🔥 FIX: JanitorAI/clients may send the actual NIM model ID directly
-    // (e.g. "deepseek-ai/deepseek-v4-flash-0731") rather than an OpenAI-style
-    // alias like "gpt-4o". Previously this fell through to a "probe" request
-    // that silently rerouted to a fallback model whenever the probe itself
-    // hit a transient error (like the 410s we've been seeing) - meaning the
-    // real request never even reached DeepSeek on those attempts. Since a
-    // string containing "/" is already a well-formed NIM model ID, use it
-    // directly and let the real request (with retry-on-410 below) absorb
-    // any flakiness, instead of gambling on a second, throwaway call first.
+    // 🔥 FIX: JanitorAI/SillyTavern may send the actual NIM model ID directly
+    // (e.g. "stepfun-ai/step-3.7-flash") rather than an OpenAI-style alias
+    // like "gpt-4o". Previously this fell through to a "probe" request that
+    // silently rerouted to a fallback model whenever the probe itself hit a
+    // transient error (like the 410s we've been seeing) - meaning the real
+    // request never even reached the intended model on those attempts.
+    // Since a string containing "/" is already a well-formed NIM model ID,
+    // use it directly and let the real request (with retry logic below)
+    // absorb any flakiness, instead of gambling on a second, throwaway call
+    // first. This also means new models can be tried from the client side
+    // without needing a matching proxy deploy each time.
     if (!nimModel && model.includes('/')) {
       nimModel = model;
     }
@@ -117,7 +131,8 @@ app.post('/v1/chat/completions', async (req, res) => {
           model: model, messages: [{ role: 'user', content: 'test' }], max_tokens: 1
         }, {
           headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
-          validateStatus: (status) => status < 500
+          validateStatus: (status) => status < 500,
+          timeout: REQUEST_TIMEOUT_MS
         });
         if (probe.status >= 200 && probe.status < 300) {
           nimModel = model;
@@ -183,12 +198,22 @@ app.post('/v1/chat/completions', async (req, res) => {
             'Authorization': `Bearer ${NIM_API_KEY}`,
             'Content-Type': 'application/json'
           },
-          responseType: stream ? 'stream' : 'json'
+          responseType: stream ? 'stream' : 'json',
+          timeout: REQUEST_TIMEOUT_MS
         });
         break;
       } catch (error) {
-        if (RETRYABLE_STATUSES.includes(error.response?.status) && retries > 1) {
-          console.warn(`NVIDIA API error (${error.response.status}) on ${nimModel}. Retrying...`);
+        // 🔥 FIX: A stalled/hung connection surfaces as an axios timeout
+        // (error.code === 'ECONNABORTED'), not as an HTTP status code, so it
+        // wasn't being caught by the RETRYABLE_STATUSES check before. Now a
+        // timeout is retried the same way a 410/503/429 is, instead of the
+        // request just dying silently after ~5 minutes on someone else's clock.
+        const isRetryable =
+          RETRYABLE_STATUSES.includes(error.response?.status) ||
+          error.code === 'ECONNABORTED';
+
+        if (isRetryable && retries > 1) {
+          console.warn(`NVIDIA API error (${error.response?.status || error.code}) on ${nimModel}. Retrying...`);
           retries--;
           await new Promise(res => setTimeout(res, delay));
           delay *= 1.5;
