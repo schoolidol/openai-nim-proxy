@@ -31,6 +31,36 @@ const MODEL_MAPPING = {
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
 };
 
+// 🔥 FIX: Per-model reasoning/thinking config.
+// Different backends expect different trigger conventions - a single
+// one-size-fits-all payload was causing invalid_request errors on
+// DeepSeek's chat template, which only accepts `thinking` and
+// `reasoning_effort` nested inside `chat_template_kwargs`.
+function getReasoningPayload(nimModel) {
+  if (!ENABLE_THINKING_MODE) return {};
+
+  if (nimModel === 'deepseek-ai/deepseek-v4-flash-0731') {
+    // Matches NVIDIA's documented request shape for this model exactly.
+    return {
+      chat_template_kwargs: {
+        thinking: true,
+        reasoning_effort: 'high'
+      }
+    };
+  }
+
+  // Default: Nemotron/vLLM-style reasoning kwargs used by the other
+  // mapped models. Extend this with more per-model branches as needed.
+  return {
+    reasoning_effort: 'high',
+    chat_template_kwargs: {
+      enable_thinking: true,
+      thinking: true,
+      clear_thinking: false
+    }
+  };
+}
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -81,6 +111,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (ENABLE_THINKING_MODE) {
       // Per NVIDIA docs: Use "detailed thinking on" to trigger native reasoning mode
+      // (Nemotron-style models). Harmless no-op for models that don't use this
+      // convention, like DeepSeek, which is driven entirely by chat_template_kwargs below.
       const systemMsgIndex = processedMessages.findIndex(m => m.role === 'system');
       const forceReasoningPrompt = "detailed thinking on. You must conduct all internal reasoning steps strictly in English.";
 
@@ -98,16 +130,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       temperature: temperature || 0.6,
       max_tokens: max_tokens || 8192,
       stream: stream || false,
-      ...(ENABLE_THINKING_MODE && {
-        // Native OpenAI reasoning flag
-        reasoning_effort: "high",
-        // NVIDIA-specific kwargs required for vLLM/TRT-LLM reasoning pipelines
-        chat_template_kwargs: {
-          enable_thinking: true,
-          thinking: true,
-          clear_thinking: false
-        }
-      })
+      ...getReasoningPayload(nimModel)
     };
 
     let response;
@@ -240,10 +263,23 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    console.error('Proxy error:', error.message);
+    // 🔥 FIX: Surface the real NVIDIA error body instead of the generic
+    // axios "Request failed with status code XXX" message. This is what
+    // was hiding the actual reason behind the 410 responses.
+    const nvidiaDetail = error.response?.data?.detail
+      || error.response?.data?.error?.message
+      || error.response?.data;
+
+    console.error(
+      'Proxy error:',
+      error.message,
+      '| NVIDIA response body:',
+      JSON.stringify(error.response?.data)
+    );
+
     res.status(error.response?.status || 500).json({
       error: {
-        message: error.message || 'Internal server error',
+        message: nvidiaDetail || error.message || 'Internal server error',
         type: 'invalid_request_error',
         code: error.response?.status || 500
       }
