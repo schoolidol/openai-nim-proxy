@@ -37,7 +37,7 @@ const RETRYABLE_STATUSES = [503, 429, 410];
 // eventually killed it on their own end (~5 min later) instead of your own
 // retry logic ever getting a chance to run. Tune this based on how long a
 // normal generation takes for your longest responses.
-const REQUEST_TIMEOUT_MS = 30000;
+const REQUEST_TIMEOUT_MS = 40000;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
