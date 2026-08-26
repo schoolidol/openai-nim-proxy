@@ -21,6 +21,16 @@ const SHOW_REASONING = true;
 // 🔥 THINKING MODE TOGGLE
 const ENABLE_THINKING_MODE = true;
 
+// 🔥 FIX: meta/llama-3.1-8b-instruct reached end-of-life 2026-08-26 and is no
+// longer valid. Use this as the last-resort fallback instead - swap it for
+// whatever known-good, currently-live model you want as the safety net.
+const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
+
+// Statuses worth retrying automatically. 410 was added after observing that
+// DeepSeek/Nemotron NIM deployments sometimes return 410 on a stale routed
+// instance, but succeed immediately on a fresh retry.
+const RETRYABLE_STATUSES = [503, 429, 410];
+
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
   'gpt-4': 'qwen/qwen3-coder-480b-a35b-instruct',
@@ -78,21 +88,32 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
+  // 🔥 FIX: Log the exact model string the client sends, so we can see
+  // whether it's actually matching MODEL_MAPPING or silently falling
+  // through to the probe/default logic below.
+  console.log('Incoming model requested:', JSON.stringify(req.body.model));
+
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
     let nimModel = MODEL_MAPPING[model];
     if (!nimModel) {
       try {
-        await axios.post(`${NIM_API_BASE}/chat/completions`, {
+        const probe = await axios.post(`${NIM_API_BASE}/chat/completions`, {
           model: model, messages: [{ role: 'user', content: 'test' }], max_tokens: 1
         }, {
           headers: { 'Authorization': `Bearer ${NIM_API_KEY}`, 'Content-Type': 'application/json' },
           validateStatus: (status) => status < 500
-        }).then(res => {
-          if (res.status >= 200 && res.status < 300) nimModel = model;
         });
-      } catch (e) {}
+        if (probe.status >= 200 && probe.status < 300) {
+          nimModel = model;
+        } else {
+          // 🔥 FIX: log why the probe didn't resolve instead of swallowing it silently.
+          console.warn(`Probe for model "${model}" returned status ${probe.status}:`, JSON.stringify(probe.data));
+        }
+      } catch (e) {
+        console.warn(`Probe request failed for model "${model}":`, e.response?.data ? JSON.stringify(e.response.data) : e.message);
+      }
       
       if (!nimModel) {
         const modelLower = model.toLowerCase();
@@ -101,10 +122,15 @@ app.post('/v1/chat/completions', async (req, res) => {
         } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
           nimModel = 'meta/llama-3.1-70b-instruct';
         } else {
-          nimModel = 'meta/llama-3.1-8b-instruct';
+          // 🔥 FIX: meta/llama-3.1-8b-instruct is end-of-life; use the
+          // configured default instead, and log that we hit this path.
+          console.warn(`No mapping/probe match for "${model}". Falling back to default: ${DEFAULT_FALLBACK_MODEL}`);
+          nimModel = DEFAULT_FALLBACK_MODEL;
         }
       }
     }
+
+    console.log(`Resolved "${model}" -> NIM model "${nimModel}"`);
 
     // Clone messages safely
     let processedMessages = JSON.parse(JSON.stringify(messages));
@@ -134,7 +160,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
 
     let response;
-    let retries = 3;
+    let retries = 4;
     let delay = 1000;
 
     while (retries > 0) {
@@ -148,8 +174,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
         break;
       } catch (error) {
-        if ((error.response?.status === 503 || error.response?.status === 429) && retries > 1) {
-          console.warn(`NVIDIA API busy (${error.response.status}). Retrying...`);
+        if (RETRYABLE_STATUSES.includes(error.response?.status) && retries > 1) {
+          console.warn(`NVIDIA API error (${error.response.status}) on ${nimModel}. Retrying...`);
           retries--;
           await new Promise(res => setTimeout(res, delay));
           delay *= 1.5;
@@ -263,9 +289,8 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    // 🔥 FIX: Surface the real NVIDIA error body instead of the generic
-    // axios "Request failed with status code XXX" message. This is what
-    // was hiding the actual reason behind the 410 responses.
+    // Surface the real NVIDIA error body instead of the generic
+    // axios "Request failed with status code XXX" message.
     const nvidiaDetail = error.response?.data?.detail
       || error.response?.data?.error?.message
       || error.response?.data;
