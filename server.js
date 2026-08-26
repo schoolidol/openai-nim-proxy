@@ -88,15 +88,29 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-  // 🔥 FIX: Log the exact model string the client sends, so we can see
-  // whether it's actually matching MODEL_MAPPING or silently falling
-  // through to the probe/default logic below.
+  // Log the exact model string the client sends, so we can see whether
+  // it's matching MODEL_MAPPING, being used directly as a NIM ID, or
+  // falling through to the probe/default logic below.
   console.log('Incoming model requested:', JSON.stringify(req.body.model));
 
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
     
     let nimModel = MODEL_MAPPING[model];
+
+    // 🔥 FIX: JanitorAI/clients may send the actual NIM model ID directly
+    // (e.g. "deepseek-ai/deepseek-v4-flash-0731") rather than an OpenAI-style
+    // alias like "gpt-4o". Previously this fell through to a "probe" request
+    // that silently rerouted to a fallback model whenever the probe itself
+    // hit a transient error (like the 410s we've been seeing) - meaning the
+    // real request never even reached DeepSeek on those attempts. Since a
+    // string containing "/" is already a well-formed NIM model ID, use it
+    // directly and let the real request (with retry-on-410 below) absorb
+    // any flakiness, instead of gambling on a second, throwaway call first.
+    if (!nimModel && model.includes('/')) {
+      nimModel = model;
+    }
+
     if (!nimModel) {
       try {
         const probe = await axios.post(`${NIM_API_BASE}/chat/completions`, {
@@ -108,7 +122,6 @@ app.post('/v1/chat/completions', async (req, res) => {
         if (probe.status >= 200 && probe.status < 300) {
           nimModel = model;
         } else {
-          // 🔥 FIX: log why the probe didn't resolve instead of swallowing it silently.
           console.warn(`Probe for model "${model}" returned status ${probe.status}:`, JSON.stringify(probe.data));
         }
       } catch (e) {
@@ -122,8 +135,8 @@ app.post('/v1/chat/completions', async (req, res) => {
         } else if (modelLower.includes('claude') || modelLower.includes('gemini') || modelLower.includes('70b')) {
           nimModel = 'meta/llama-3.1-70b-instruct';
         } else {
-          // 🔥 FIX: meta/llama-3.1-8b-instruct is end-of-life; use the
-          // configured default instead, and log that we hit this path.
+          // meta/llama-3.1-8b-instruct is end-of-life; use the configured
+          // default instead, and log that we hit this path.
           console.warn(`No mapping/probe match for "${model}". Falling back to default: ${DEFAULT_FALLBACK_MODEL}`);
           nimModel = DEFAULT_FALLBACK_MODEL;
         }
