@@ -39,7 +39,7 @@ const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
 
 const RETRYABLE_STATUSES = [503, 429, 410];
 
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 180000;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
@@ -60,12 +60,12 @@ function getReasoningPayload(nimModel) {
 
   // Matches any DeepSeek V4 variant (Flash, Pro, and future dated releases)
   // using NVIDIA's documented request shape - chat_template_kwargs.thinking
-  // + reasoning_effort, no top-level reasoning_effort field.
+  // + reasoning_effort. 'xhigh' maps to DeepSeek's max reasoning depth.
   if (nimModel.startsWith('deepseek-ai/deepseek-v4')) {
     return {
       chat_template_kwargs: {
         thinking: true,
-        reasoning_effort: 'high'
+        reasoning_effort: 'xhigh'
       }
     };
   }
@@ -190,7 +190,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     };
 
     let response;
-    let retries = 4;
+    // 🔥 Retries disabled: retries = 1 means the loop makes a single attempt
+    // and throws immediately on any error instead of looping, so failures
+    // (410, timeout, etc.) surface right away. Bump this back up (e.g. 4) if
+    // you want automatic retries again later.
+    let retries = 1;
     let delay = 1000;
 
     while (retries > 0) {
