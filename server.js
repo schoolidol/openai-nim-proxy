@@ -15,29 +15,15 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
-// 🔥 REASONING DISPLAY TOGGLE
 const SHOW_REASONING = true;
 
-// 🔥 THINKING MODE TOGGLE
 const ENABLE_THINKING_MODE = true;
 
-// 🔥 FIX: meta/llama-3.1-8b-instruct reached end-of-life 2026-08-26 and is no
-// longer valid. Use this as the last-resort fallback instead - swap it for
-// whatever known-good, currently-live model you want as the safety net.
 const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
 
-// Statuses worth retrying automatically. 410 was added after observing that
-// DeepSeek/Nemotron NIM deployments sometimes return 410 on a stale routed
-// instance, but succeed immediately on a fresh retry.
 const RETRYABLE_STATUSES = [503, 429, 410];
 
-// 🔥 FIX: How long to wait for NVIDIA before giving up on a single attempt.
-// Previously there was no timeout at all (axios default = 0 = wait forever),
-// so a stalled request would just hang until JanitorAI/SillyTavern or Render
-// eventually killed it on their own end (~5 min later) instead of your own
-// retry logic ever getting a chance to run. Tune this based on how long a
-// normal generation takes for your longest responses.
-const REQUEST_TIMEOUT_MS = 40000;
+const REQUEST_TIMEOUT_MS = 50000;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
@@ -50,16 +36,11 @@ const MODEL_MAPPING = {
   'deepseek-ai/deepseek-v4-flash-0731': 'deepseek-ai/deepseek-v4-flash-0731'
 };
 
-// 🔥 FIX: Per-model reasoning/thinking config.
-// Different backends expect different trigger conventions - a single
-// one-size-fits-all payload was causing invalid_request errors on
-// DeepSeek's chat template, which only accepts `thinking` and
-// `reasoning_effort` nested inside `chat_template_kwargs`.
+
 function getReasoningPayload(nimModel) {
   if (!ENABLE_THINKING_MODE) return {};
 
   if (nimModel === 'deepseek-ai/deepseek-v4-flash-0731') {
-    // Matches NVIDIA's documented request shape for this model exactly.
     return {
       chat_template_kwargs: {
         thinking: true,
@@ -68,11 +49,6 @@ function getReasoningPayload(nimModel) {
     };
   }
 
-  // Default: Nemotron/vLLM-style reasoning kwargs used by the other
-  // mapped models. NOTE: models added later via the includes('/') fallback
-  // below will also hit this default branch - if a new model starts
-  // throwing 400/410s that retries don't fix, this mismatch is the first
-  // place to check and give its own branch, same as DeepSeek got.
   return {
     reasoning_effort: 'high',
     chat_template_kwargs: {
@@ -110,17 +86,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     let nimModel = MODEL_MAPPING[model];
 
-    // 🔥 FIX: JanitorAI/SillyTavern may send the actual NIM model ID directly
-    // (e.g. "stepfun-ai/step-3.7-flash") rather than an OpenAI-style alias
-    // like "gpt-4o". Previously this fell through to a "probe" request that
-    // silently rerouted to a fallback model whenever the probe itself hit a
-    // transient error (like the 410s we've been seeing) - meaning the real
-    // request never even reached the intended model on those attempts.
-    // Since a string containing "/" is already a well-formed NIM model ID,
-    // use it directly and let the real request (with retry logic below)
-    // absorb any flakiness, instead of gambling on a second, throwaway call
-    // first. This also means new models can be tried from the client side
-    // without needing a matching proxy deploy each time.
+  
     if (!nimModel && model.includes('/')) {
       nimModel = model;
     }
@@ -203,11 +169,7 @@ app.post('/v1/chat/completions', async (req, res) => {
         });
         break;
       } catch (error) {
-        // 🔥 FIX: A stalled/hung connection surfaces as an axios timeout
-        // (error.code === 'ECONNABORTED'), not as an HTTP status code, so it
-        // wasn't being caught by the RETRYABLE_STATUSES check before. Now a
-        // timeout is retried the same way a 410/503/429 is, instead of the
-        // request just dying silently after ~5 minutes on someone else's clock.
+        
         const isRetryable =
           RETRYABLE_STATUSES.includes(error.response?.status) ||
           error.code === 'ECONNABORTED';
