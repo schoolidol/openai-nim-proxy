@@ -23,7 +23,7 @@ const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
 
 const RETRYABLE_STATUSES = [503, 429, 410];
 
-const REQUEST_TIMEOUT_MS = 50000;
+const REQUEST_TIMEOUT_MS = 120000;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
