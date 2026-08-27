@@ -290,17 +290,34 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
-    // Surface the real NVIDIA error body instead of the generic
-    // axios "Request failed with status code XXX" message.
-    const nvidiaDetail = error.response?.data?.detail
-      || error.response?.data?.error?.message
-      || error.response?.data;
+    // 🔥 FIX: When a streaming request (responseType: 'stream') errors out,
+    // error.response.data is a raw Node stream/socket object, not JSON - it
+    // contains circular references (agent -> sockets -> ... -> agent) that
+    // crash JSON.stringify outright. Detect that case and fall back to a
+    // plain status-based message instead of trying to serialize the stream.
+    const rawData = error.response?.data;
+    const isStreamBody = rawData && typeof rawData.pipe === 'function';
+
+    let nvidiaDetail;
+    let loggedBody;
+
+    if (isStreamBody) {
+      nvidiaDetail = `NVIDIA request failed with status ${error.response.status} (streamed response, no readable body)`;
+      loggedBody = '[stream body - not serializable]';
+    } else if (rawData !== undefined) {
+      nvidiaDetail = rawData.detail || rawData.error?.message || rawData;
+      try {
+        loggedBody = JSON.stringify(rawData);
+      } catch (e) {
+        loggedBody = '[unserializable response body]';
+      }
+    }
 
     console.error(
       'Proxy error:',
       error.message,
       '| NVIDIA response body:',
-      JSON.stringify(error.response?.data)
+      loggedBody
     );
 
     res.status(error.response?.status || 500).json({
