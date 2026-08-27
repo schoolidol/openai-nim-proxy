@@ -80,10 +80,10 @@ app.post('/v1/chat/completions', async (req, res) => {
   // it's matching MODEL_MAPPING, being used directly as a NIM ID, or
   // falling through to the probe/default logic below.
   console.log('Incoming model requested:', JSON.stringify(req.body.model));
-  console.log('stream:', stream);
 
   try {
     const { model, messages, temperature, max_tokens, stream } = req.body;
+    console.log('stream:', stream);
     
     let nimModel = MODEL_MAPPING[model];
 
