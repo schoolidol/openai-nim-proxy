@@ -3,6 +3,22 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 
+// 🔥 FIX: A stream-mode axios request that times out can leave its
+// underlying socket emitting an 'error' event *after* the request promise
+// already rejected. If nothing is listening for that event, Node treats it
+// as fatal and crashes the whole process - which is why Render was showing
+// a fresh "Detected service running on port 10000" boot line right after a
+// retry: the process had actually died and been auto-restarted, taking every
+// other in-flight conversation down with it. These handlers turn that into
+// a logged warning instead of a full crash.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -23,7 +39,7 @@ const DEFAULT_FALLBACK_MODEL = 'meta/llama-3.1-405b-instruct';
 
 const RETRYABLE_STATUSES = [503, 429, 410];
 
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 180000;
 
 const MODEL_MAPPING = {
   'gpt-3.5-turbo': 'nvidia/llama-3.1-nemotron-ultra-253b-v1',
@@ -33,18 +49,37 @@ const MODEL_MAPPING = {
   'claude-3-opus': 'openai/gpt-oss-120b',
   'claude-3-sonnet': 'openai/gpt-oss-20b',
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
-  'deepseek-ai/deepseek-v4-flash-0731': 'deepseek-ai/deepseek-v4-flash-0731'
+  'deepseek-ai/deepseek-v4-flash-0731': 'deepseek-ai/deepseek-v4-flash-0731',
+  'deepseek-ai/deepseek-v4-pro-0813': 'deepseek-ai/deepseek-v4-pro-0813',
+  'moonshotai/kimi-k3': 'moonshotai/kimi-k3'
 };
 
 
 function getReasoningPayload(nimModel) {
   if (!ENABLE_THINKING_MODE) return {};
 
-  if (nimModel === 'deepseek-ai/deepseek-v4-flash-0731') {
+  // Matches any DeepSeek V4 variant (Flash, Pro, and future dated releases)
+  // using NVIDIA's documented request shape - chat_template_kwargs.thinking
+  // + reasoning_effort, no top-level reasoning_effort field.
+  if (nimModel.startsWith('deepseek-ai/deepseek-v4')) {
     return {
       chat_template_kwargs: {
         thinking: true,
         reasoning_effort: 'high'
+      }
+    };
+  }
+
+  // 🔥 FIX: Moonshot/Kimi models (K2.5, K2-Thinking, K2-Instruct, K3, etc.)
+  // use a minimal payload per NVIDIA's own documented examples - just
+  // chat_template_kwargs.thinking, no enable_thinking/clear_thinking, and
+  // no top-level reasoning_effort. Sending the generic Nemotron-style kwargs
+  // below to this family risks the same invalid_request/hang issues DeepSeek
+  // had with a mismatched payload shape.
+  if (nimModel.startsWith('moonshotai/')) {
+    return {
+      chat_template_kwargs: {
+        thinking: true
       }
     };
   }
