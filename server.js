@@ -329,6 +329,22 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
     
   } catch (error) {
+    // 🔥 Log rate-limit headers when present - these aren't part of the
+    // circular stream body, so they're always safe to read even when the
+    // response data itself isn't. Helps distinguish a per-minute burst
+    // limit from an hourly/daily quota, and shows exactly when it resets.
+    const rateLimitHeaders = error.response?.headers
+      ? {
+          limit: error.response.headers['x-ratelimit-limit'],
+          remaining: error.response.headers['x-ratelimit-remaining'],
+          reset: error.response.headers['x-ratelimit-reset'],
+          retryAfter: error.response.headers['retry-after']
+        }
+      : null;
+    if (error.response?.status === 429 && rateLimitHeaders) {
+      console.warn('Rate limit headers:', JSON.stringify(rateLimitHeaders));
+    }
+
     // 🔥 FIX: When a streaming request (responseType: 'stream') errors out,
     // error.response.data is a raw Node stream/socket object, not JSON - it
     // contains circular references (agent -> sockets -> ... -> agent) that
