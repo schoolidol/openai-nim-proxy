@@ -65,7 +65,7 @@ function getReasoningPayload(nimModel) {
     return {
       chat_template_kwargs: {
         thinking: true,
-        reasoning_effort: 'xhigh'
+        reasoning_effort: 'low'
       }
     };
   }
