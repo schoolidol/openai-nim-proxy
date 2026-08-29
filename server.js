@@ -78,6 +78,7 @@ function getReasoningPayload(nimModel) {
   // had with a mismatched payload shape.
   if (nimModel.startsWith('moonshotai/')) {
     return {
+      reasoning_effort: 'low',
       chat_template_kwargs: {
         thinking: true
       }
